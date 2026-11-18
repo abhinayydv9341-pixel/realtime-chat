@@ -1,0 +1,58 @@
+# Two app instances share one Postgres and one Redis to demonstrate horizontal scaling:
+# connect one browser tab to :3000 and another to :3001 and chat between them.
+x-app: &app
+  build: .
+  environment: &app-env
+    DATABASE_URL: postgres://chat:chat@postgres:5432/chat
+    REDIS_URL: redis://redis:6379
+    JWT_SECRET: ${JWT_SECRET:-local-dev-secret-please-change}
+    MESSAGE_RATE_LIMIT: 10
+    MESSAGE_RATE_WINDOW_MS: 10000
+  depends_on:
+    postgres:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+  restart: unless-stopped
+
+services:
+  app1:
+    <<: *app
+    environment:
+      <<: *app-env
+      INSTANCE_ID: app1
+    ports:
+      - "3000:3000"
+
+  app2:
+    <<: *app
+    environment:
+      <<: *app-env
+      INSTANCE_ID: app2
+    ports:
+      - "3001:3000"
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: chat
+      POSTGRES_PASSWORD: chat
+      POSTGRES_DB: chat
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U chat -d chat"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  pgdata:

@@ -1,0 +1,186 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Realtime Chat</title>
+<style>
+  :root { --bg:#f6f7f9; --panel:#fff; --line:#e3e6ea; --text:#1d2330; --muted:#6b7280; --accent:#2563eb; --ok:#16a34a; }
+  * { box-sizing: border-box; }
+  body { margin:0; font:14px/1.45 system-ui, -apple-system, Segoe UI, sans-serif; background:var(--bg); color:var(--text); }
+  header { padding:10px 16px; background:var(--panel); border-bottom:1px solid var(--line); display:flex; gap:12px; align-items:center; }
+  header h1 { font-size:16px; margin:0; flex:1; }
+  main { display:grid; grid-template-columns:240px 1fr 200px; height:calc(100vh - 49px); }
+  aside, section { background:var(--panel); border-right:1px solid var(--line); overflow:auto; }
+  aside h2 { font-size:12px; text-transform:uppercase; color:var(--muted); margin:14px 12px 6px; }
+  .item { padding:6px 12px; cursor:pointer; display:flex; justify-content:space-between; }
+  .item:hover, .item.active { background:#eef2ff; }
+  .dot { width:8px; height:8px; border-radius:50%; background:var(--ok); display:inline-block; margin-right:6px; }
+  section { display:flex; flex-direction:column; }
+  #messages { flex:1; overflow:auto; padding:12px 16px; }
+  .msg { margin:4px 0; } .msg b { margin-right:6px; } .msg time { color:var(--muted); font-size:11px; margin-left:6px; }
+  #typing { color:var(--muted); font-size:12px; padding:0 16px; height:18px; }
+  form.row { display:flex; gap:6px; padding:10px; border-top:1px solid var(--line); }
+  input { flex:1; padding:7px 9px; border:1px solid var(--line); border-radius:6px; font:inherit; }
+  button { padding:7px 12px; border:0; border-radius:6px; background:var(--accent); color:#fff; font:inherit; cursor:pointer; }
+  button.link { background:none; color:var(--accent); padding:4px; }
+  #login { max-width:320px; margin:12vh auto; background:var(--panel); padding:24px; border-radius:10px; border:1px solid var(--line); display:grid; gap:10px; }
+  #error { color:#dc2626; min-height:20px; }
+  @media (max-width: 720px) { main { grid-template-columns:1fr; } aside#people { display:none; } }
+</style>
+</head>
+<body>
+<div id="login">
+  <h2 style="margin:0">Realtime Chat</h2>
+  <input id="username" placeholder="username" autocomplete="username">
+  <input id="password" type="password" placeholder="password (8+ chars)" autocomplete="current-password">
+  <div style="display:flex; gap:8px"><button id="btn-login">Log in</button><button id="btn-register" class="link">Register</button></div>
+  <div id="error"></div>
+</div>
+
+<div id="app" hidden>
+  <header><h1>Realtime Chat</h1><span id="me"></span><button class="link" id="btn-logout">Log out</button></header>
+  <main>
+    <aside>
+      <h2>My rooms</h2><div id="rooms"></div>
+      <form class="row" id="new-room"><input id="room-name" placeholder="New room"><button>+</button></form>
+      <h2>Discover</h2><div id="public"></div>
+    </aside>
+    <section>
+      <div id="messages"></div>
+      <div id="typing"></div>
+      <form class="row" id="composer"><input id="body" placeholder="Message" autocomplete="off"><button>Send</button></form>
+    </section>
+    <aside id="people"><h2>Online</h2><div id="online"></div></aside>
+  </main>
+</div>
+
+<script src="/socket.io/socket.io.js"></script>
+<script>
+const $ = (id) => document.getElementById(id);
+const state = { token: localStorageGet('token'), user: null, rooms: [], current: null, cursor: null, socket: null, usernames: {} };
+
+function localStorageGet(k) { try { return localStorage.getItem(k); } catch { return null; } }
+function localStorageSet(k, v) { try { v == null ? localStorage.removeItem(k) : localStorage.setItem(k, v); } catch {} }
+
+async function api(path, opts = {}) {
+  const res = await fetch('/api' + path, {
+    method: opts.method || 'GET',
+    headers: { 'Content-Type': 'application/json', ...(state.token ? { Authorization: 'Bearer ' + state.token } : {}) },
+    body: opts.body ? JSON.stringify(opts.body) : undefined,
+  });
+  if (res.status === 204) return null;
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.error ? data.error.message : res.statusText);
+  return data;
+}
+
+async function authenticate(kind) {
+  $('error').textContent = '';
+  try {
+    const data = await api('/auth/' + kind, { method: 'POST', body: { username: $('username').value, password: $('password').value } });
+    state.token = data.token; localStorageSet('token', data.token);
+    await start();
+  } catch (e) { $('error').textContent = e.message; }
+}
+$('btn-login').onclick = () => authenticate('login');
+$('btn-register').onclick = () => authenticate('register');
+$('btn-logout').onclick = async () => { await api('/auth/logout', { method: 'POST' }).catch(() => {}); localStorageSet('token', null); location.reload(); };
+
+async function start() {
+  const { user } = await api('/auth/me');
+  state.user = user;
+  $('login').hidden = true; $('app').hidden = false; $('me').textContent = user.username;
+  await refreshRooms();
+  const socket = io({ auth: { token: state.token }, transports: ['websocket'] });
+  state.socket = socket;
+  socket.on('message:new', (m) => { if (state.current && m.roomId === state.current.id) appendMessage(m, true); });
+  socket.on('room:joined', refreshRooms);
+  socket.on('presence:update', refreshPresence);
+  socket.on('session:ready', refreshPresence);
+  let typingTimer;
+  socket.on('typing', (t) => {
+    if (!state.current || t.roomId !== state.current.id) return;
+    $('typing').textContent = t.username + ' is typing…';
+    clearTimeout(typingTimer); typingTimer = setTimeout(() => ($('typing').textContent = ''), 2000);
+  });
+  socket.on('disconnect', (reason) => { if (reason === 'io server disconnect') { localStorageSet('token', null); location.reload(); } });
+}
+
+async function refreshRooms() {
+  const [mine, pub] = await Promise.all([api('/rooms'), api('/rooms/public')]);
+  state.rooms = mine.rooms;
+  const myIds = new Set(mine.rooms.map((r) => r.id));
+  $('rooms').replaceChildren(...mine.rooms.map((r) => row(r.name, r.kind === 'direct' ? 'DM' : r.memberCount, () => openRoom(r), state.current && state.current.id === r.id)));
+  $('public').replaceChildren(...pub.rooms.filter((r) => !myIds.has(r.id)).map((r) => row(r.name, 'join', async () => { await api('/rooms/' + r.id + '/join', { method: 'POST' }); await refreshRooms(); })));
+}
+
+async function refreshPresence() {
+  const { userIds } = await api('/presence');
+  $('online').replaceChildren(...userIds.map((id) => {
+    const el = row((state.usernames[id] || 'user #' + id) + (id === state.user.id ? ' (you)' : ''), '', id === state.user.id ? null : async () => {
+      const { room } = await api('/dm/' + id, { method: 'POST' }); await refreshRooms(); openRoom(room);
+    });
+    el.prepend(Object.assign(document.createElement('span'), { className: 'dot' }));
+    return el;
+  }));
+}
+
+function row(label, meta, onClick, active) {
+  const el = document.createElement('div');
+  el.className = 'item' + (active ? ' active' : '');
+  el.append(Object.assign(document.createElement('span'), { textContent: label }), Object.assign(document.createElement('small'), { textContent: meta }));
+  if (onClick) el.onclick = onClick;
+  return el;
+}
+
+async function openRoom(room) {
+  state.current = room; state.cursor = null;
+  $('messages').replaceChildren();
+  await refreshRooms();
+  await loadOlder();
+}
+
+async function loadOlder() {
+  const q = state.cursor ? '?cursor=' + encodeURIComponent(state.cursor) : '';
+  const page = await api('/rooms/' + state.current.id + '/messages' + q);
+  state.cursor = page.nextCursor;
+  const box = $('messages');
+  const oldTop = box.querySelector('.older'); if (oldTop) oldTop.remove();
+  page.messages.forEach((m) => appendMessage(m, false));
+  if (page.nextCursor) {
+    const more = Object.assign(document.createElement('button'), { className: 'link older', textContent: 'Load older messages', onclick: loadOlder });
+    box.prepend(more);
+  }
+  if (!q) box.scrollTop = box.scrollHeight;
+}
+
+function appendMessage(m, atBottom) {
+  state.usernames[m.senderId] = m.senderUsername;
+  const el = document.createElement('div'); el.className = 'msg';
+  el.append(Object.assign(document.createElement('b'), { textContent: m.senderUsername }), document.createTextNode(m.body),
+    Object.assign(document.createElement('time'), { textContent: new Date(m.createdAt).toLocaleTimeString() }));
+  const box = $('messages');
+  if (atBottom) { box.append(el); box.scrollTop = box.scrollHeight; }
+  else { const older = box.querySelector('.older'); older ? older.after(el) : box.prepend(el); }
+}
+
+$('composer').onsubmit = async (e) => {
+  e.preventDefault();
+  const body = $('body').value.trim();
+  if (!body || !state.current) return;
+  const ack = await state.socket.emitWithAck('message:send', { roomId: state.current.id, body });
+  if (ack.ok) $('body').value = ''; else alert(ack.error.message);
+};
+$('body').oninput = () => state.current && state.socket.emit('typing', { roomId: state.current.id });
+$('new-room').onsubmit = async (e) => {
+  e.preventDefault();
+  const name = $('room-name').value.trim(); if (!name) return;
+  const { room } = await api('/rooms', { method: 'POST', body: { name } });
+  $('room-name').value = ''; await openRoom(room);
+};
+
+if (state.token) start().catch(() => { localStorageSet('token', null); state.token = null; });
+</script>
+</body>
+</html>
